@@ -77,6 +77,36 @@ SAFT figures draw the saved COMSOL defect outline as a dashed cyan polygon.
 For a later matching model, pass `--defect-model path/to/model.mph` to
 `plotting.py`; build and save its geometry first so the outline is current.
 
+## Raw and envelope comparison near the root
+
+The [laser-ultrasonic T-SAFT study](https://www.mdpi.com/1424-8220/23/19/8036)
+compares images formed from raw traces and Hilbert-transformed traces. Run
+the same comparison on the weld root with one receiver line and one P/S mode
+at a time:
+
+```powershell
+python plotting.py --compare-raw-envelope --line right --mode PP --pixel-size-mm 0.10 --output figures/root_raw_envelope_PP.png
+python plotting.py --compare-raw-envelope --line right --mode SS --pixel-size-mm 0.10 --output figures/root_raw_envelope_SS.png
+```
+
+Current images: [PP comparison](figures/root_raw_envelope_PP.png) and
+[SS comparison](figures/root_raw_envelope_SS.png).
+
+The four panels show raw and Hilbert-envelope reconstructions for the direct
+and receiver-leg back-wall paths. Raw means the absolute value of the signed
+delay-and-sum image; envelope means the magnitude of the coherently summed
+analytic traces. Both methods use the same defect-minus-reference signals,
+2-8 MHz filter, travel times, and receiver aperture. All four panels share
+one amplitude scale and show the known COMSOL defect outline. The root view
+covers `x=-4..8 mm` and `y=0..7 mm`. A 0.10 mm grid samples the image more
+densely than the usual 0.25 mm command-line grid; it does not add measured
+spatial resolution or fix an incorrect travel-time model.
+
+The saved PP and SS examples show different raw/envelope behavior. Neither
+produces a narrow response that follows the full curved defect outline, so
+the comparison is a processing diagnostic rather than a validated defect
+location.
+
 ## Defect evidence and localization check
 
 ```powershell

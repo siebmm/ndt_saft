@@ -966,6 +966,120 @@ def plot_defect_evidence(
     return fig, axes
 
 
+def plot_root_saft_comparison(
+    receiver_line='right',
+    mode='PP',
+    pixel_size=0.0001,
+    x_range=(-0.004, 0.008),
+    y_range=(0.0, 0.007),
+    frequency_band=(2e6, 8e6),
+    time_offset=0.0,
+    colour_percentile=99.5,
+    defect_model=DEFECT_MODEL,
+):
+    """Compare raw and Hilbert-envelope SAFT near the weld root.
+
+    Parameters
+    ----------
+    receiver_line : {'left', 'right', 'weld'}, default='right'
+        One receiver line used for every image.
+    mode : {'PP', 'PS', 'SP', 'SS'}, default='PP'
+        Source-to-pixel and pixel-to-receiver wave modes.
+    pixel_size : float, default=0.0001
+        Maximum image-pixel spacing in metres.
+    x_range : tuple of float, default=(-0.004, 0.008)
+        Horizontal image bounds in metres.
+    y_range : tuple of float, default=(0.0, 0.007)
+        Vertical image bounds in metres.
+    frequency_band : tuple of float or None, default=(2e6, 8e6)
+        Common band-pass range in hertz.
+    time_offset : float, default=0.0
+        Explicit delay added to both reconstructions, in seconds.
+    colour_percentile : float or None, default=99.5
+        Shared amplitude display limit; ``None`` uses the maximum.
+    defect_model : pathlib.Path or str, default=DEFECT_MODEL
+        Matching COMSOL model used only for the outline overlay.
+
+    Returns
+    -------
+    gx, gy : numpy.ndarray
+        Common image grid coordinates in metres.
+    images : dict of str to dict of str to numpy.ndarray
+        Nonnegative direct and back-wall images for ``'raw'`` and
+        ``'envelope'`` methods.
+    fig : matplotlib.figure.Figure
+        Comparison figure with a common colour scale.
+    axes : numpy.ndarray
+        Two-by-two image axes.
+
+    Raises
+    ------
+    ValueError
+        If the receiver line or propagation mode is unsupported.
+
+    Notes
+    -----
+    The raw result is the absolute value of the coherently summed real
+    traces. The envelope result is the magnitude of the coherently summed
+    analytic traces. Both use identical residual data, filter, delays, and
+    receiver aperture. The COMSOL defect outline is added after imaging.
+    """
+    if receiver_line not in ('left', 'right', 'weld'):
+        raise ValueError("receiver_line must be 'left', 'right', or 'weld'.")
+    mode = str(mode).upper()
+    if mode not in ('PP', 'PS', 'SP', 'SS'):
+        raise ValueError("mode must be 'PP', 'PS', 'SP', or 'SS'.")
+
+    defect_outline = load_comsol_defect_outline(defect_model)
+    images = {}
+    gx = gy = None
+    for method, image_mode in (('raw', 'signed'), ('envelope', 'envelope')):
+        gx, gy, components = perform_segmented_saft(
+            receiver_lines=receiver_line,
+            reference_dataset='reference',
+            source_wave_type=mode[0],
+            receiver_wave_type=mode[1],
+            pixel_size=pixel_size,
+            x_range=x_range,
+            y_range=y_range,
+            frequency_band=frequency_band,
+            time_offset=time_offset,
+            image_mode=image_mode,
+            return_components=True,
+        )
+        images[method] = {
+            component: np.abs(components[component])
+            for component in ('direct', 'backwall')
+        }
+
+    amplitudes = np.concatenate([
+        image.ravel() for method in images.values() for image in method.values()
+    ])
+    colour_limit = _symmetric_colour_limit(amplitudes, colour_percentile)
+    extent_mm = np.array([gx.min(), gx.max(), gy.min(), gy.max()]) * 1000
+    fig, axes = plt.subplots(2, 2, figsize=(12, 9), constrained_layout=True)
+    for row, method in enumerate(('raw', 'envelope')):
+        for column, component in enumerate(('direct', 'backwall')):
+            axis = axes[row, column]
+            plotted = axis.imshow(
+                images[method][component], extent=extent_mm, origin='lower',
+                cmap='inferno', vmin=0, vmax=colour_limit,
+            )
+            _draw_comsol_defect(axis, defect_outline, scale=1000)
+            axis.set_title(f'{method.capitalize()} traces | {component} path')
+            axis.set_xlabel('x [mm]')
+            axis.set_ylabel('y [mm]')
+            axis.set_aspect('equal')
+    fig.suptitle(
+        f'{receiver_line} receivers | {mode} SAFT | '
+        f'{pixel_size * 1000:g} mm pixels | '
+        f'{time_offset * 1e6:g} us timing shift'
+    )
+    fig.colorbar(plotted, ax=axes, label='SAFT amplitude [m/s]')
+    plt.show()
+    return gx, gy, images, fig, axes
+
+
 def main():
     """Plot a residual SAFT reconstruction or receiver diagnostics.
 
@@ -974,8 +1088,9 @@ def main():
     The default figure uses defect-minus-reference velocity with S waves on
     both propagation legs. ``--diagnostics`` shows the raw receiver evidence
     before SAFT reconstruction. ``--validate`` compares early side-line
-    transmission and independent receiver-aperture images. ``--output`` saves
-    either SAFT figure with the known COMSOL defect outline.
+    transmission and independent receiver-aperture images.
+    ``--compare-raw-envelope`` compares both processing choices on the same
+    weld-root grid. ``--output`` saves the selected SAFT figure.
     """
     import argparse
 
@@ -985,6 +1100,7 @@ def main():
     parser.add_argument('--pixel-size-mm', type=float, default=0.25)
     parser.add_argument('--diagnostics', action='store_true')
     parser.add_argument('--validate', action='store_true')
+    parser.add_argument('--compare-raw-envelope', action='store_true')
     parser.add_argument('--component', choices=('direct', 'backwall'), default='direct')
     parser.add_argument('--time-offset-us', type=float, default=0.0)
     parser.add_argument('--defect-model', type=Path, default=DEFECT_MODEL)
@@ -992,9 +1108,21 @@ def main():
     args = parser.parse_args()
     if args.pixel_size_mm <= 0:
         parser.error('--pixel-size-mm must be positive')
+    if sum((args.diagnostics, args.validate, args.compare_raw_envelope)) > 1:
+        parser.error('Choose one of --diagnostics, --validate, or --compare-raw-envelope')
     if args.diagnostics and args.output:
         parser.error('--output is for SAFT figures, not --diagnostics')
-    if args.validate:
+    if args.compare_raw_envelope:
+        if args.line == 'sides':
+            parser.error('--compare-raw-envelope needs one receiver line')
+        _, _, _, fig, _ = plot_root_saft_comparison(
+            receiver_line=args.line,
+            mode=args.mode,
+            pixel_size=args.pixel_size_mm / 1000,
+            time_offset=args.time_offset_us * 1e-6,
+            defect_model=args.defect_model,
+        )
+    elif args.validate:
         if args.line == 'sides':
             parser.error('--validate needs one receiver line for aperture splitting')
         fig, _ = plot_defect_evidence(
