@@ -7,8 +7,7 @@ __pycache__/
 .ruff_cache/
 .vscode/
 
-# Large COMSOL model files and temporary locks
-*.mph
+# COMSOL temporary locks
 *.mph.lock
 
 # Generated numerical reconstructions
