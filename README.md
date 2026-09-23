@@ -1,36 +1,112 @@
 # LUT weld SAFT analysis
 
-The `weld_defect_*.mph` and `weld_nodefect_*.mph` COMSOL models provide the
-defective and reference simulations. Exported vertical-velocity traces are in
-`data/receivers/`; the laser source table is in `data/sources/`.
+This project compares two COMSOL simulations of a partially welded pipe wall:
+`weld_defect_v1.mph` has a lack-of-fusion defect, and
+`weld_nodefect_v1.mph` is the reference. The receiver exports still name
+these simulations `*_v4.mph`; the project owner confirmed that the current
+`v1` archives are the matching models. Exported receiver traces are in
+`data/receivers/`, and the laser source table is in `data/sources/`.
 
-`analyse.py` contains data loading, reference calibration, travel-time models,
-and SAFT reconstruction.
+## COMSOL cross section
 
-The imaging model treats each pixel as a possible reflector. A direct arrival
-travels from the fixed laser source to the pixel and then to a receiver; the
-back-wall component adds a reflection from the inner pipe surface. Travel
-times use separate P- and S-wave speeds in parent steel and the weld/HAZ. The
-geometry is a simplified two-dimensional approximation of the COMSOL model.
+The models use a two-dimensional, 50 mm wide by 19.8 mm thick steel wall.
+Coordinates are measured from the inner back wall (`y=0`); the outer surface
+is at `y=19.8 mm`. An open groove sits above a deposited weld whose top is
+at `y=6.339 mm`. The groove walls lean by 3 degrees, the root radius is
+3.2 mm, and the HAZ extends approximately 3 mm around the weld. COMSOL uses
+temperature-dependent elastic properties with nominal temperatures of
+293.15 K in the parent steel and 573.15 K in the hot weld/HAZ.
 
-Run it for a numerical residual reconstruction:
+The source is a prescribed vertical-velocity pulse centered at `x=0` on the
+weld top. Its Gaussian spatial radius is 0.5 mm. The saved model parameter
+`f_src` is 4 MHz; the `8MHz` receiver filenames describe the exports and
+should not be read as that source parameter. COMSOL solves the full elastic
+wave equation in time, so the signals include scattering, reflection,
+diffraction, and mode conversion permitted by its geometry and mesh.
+
+The defect is a curved lack-of-fusion gap along the right root sidewall. In
+the saved, built geometry it is a polygon approximating a 2.5 mm arc with a
+0.1 mm opening. Its outline spans approximately `x=1.02..2.62 mm` and
+`y=1.66..3.62 mm`. The plotting code reads the polygon vertices from the
+COMSOL model each time it draws a localization image. The outline is a
+comparison marker and is never used to calculate SAFT delays or select an
+image peak.
+
+## Receiver lines and exported signals
+
+Each `.txt` file contains receiver `x, y` coordinates in millimetres followed
+by vertical surface velocity `vy` in metres per second. Every trace has
+2001 samples from 0 to 20 microseconds at 10 ns intervals. Each line has a
+defective-model file and a matching `_nodefect` reference file.
+
+| Line | Points | Receiver x range | Receiver y | What it shows |
+| --- | ---: | ---: | ---: | --- |
+| `left` | 45 | -15 to -4 mm | 19.8 mm | Outer surface on the left of the open groove; a useful control for the right-side defect. |
+| `right` | 45 | 4 to 15 mm | 19.8 mm | Outer surface on the defect side; the early transmitted pulse loses amplitude. |
+| `weld` | 21 | -2.5 to 2.5 mm | 6.339 mm | Top of the deposited weld around the laser source; includes a strong local source response. |
+
+Points on each line are spaced by 0.25 mm. `--line sides` loads the left and
+right lines together; the weld line is inspected separately because it is on
+a different surface and is close to the source.
+
+## SAFT reconstruction
+
+`analyse.py` loads and compares the traces, calculates travel times, and
+reconstructs SAFT images. `plotting.py` makes A-scan, B-scan, calibration, and
+SAFT figures. For each candidate reflector, the direct model follows source
+to pixel to receiver. The back-wall component adds a reflection from the
+inner surface on the receiver leg. PP, PS, SP, and SS specify wave modes on
+the source and receiver legs. The nominal background includes parent steel,
+the hot weld/HAZ, and the open groove. The known defect is absent from the
+travel-time model.
+
+SAFT uses approximate rays and piecewise P/S speeds. It does not reproduce
+COMSOL's full elastic diffraction, refraction, mode conversion at the groove,
+or wave amplitudes. Direct and back-wall results should therefore be checked
+separately before interpreting a focus as a defect.
 
 ```powershell
 python analyse.py --line right --mode SS --pixel-size-mm 0.25 --output saft_right.npz
-```
-
-The NPZ file contains the imaging grid (`x`, `y`) and the `direct`, `backwall`,
-and `combined` SAFT images. Omit `--output` to print the residual RMS and image
-peaks without saving a file.
-
-`plotting.py` contains the A-scan, B-scan, calibration, and SAFT figures. Run it
-to view a residual reconstruction or receiver diagnostics:
-
-```powershell
 python plotting.py --line right --mode SS --pixel-size-mm 0.25
 python plotting.py --line right --diagnostics
 ```
 
-The `--line` option accepts `left`, `right`, `weld`, or `sides`. `--mode` selects
-the source and receiver wave modes (`PP`, `PS`, `SP`, or `SS`). Both scripts use
-metres and seconds internally; the command-line pixel size is in millimetres.
+The NPZ file contains the grid (`x`, `y`) and the `direct`, `backwall`, and
+`combined` images. Omit `--output` to print image peaks without saving. The
+SAFT figures draw the saved COMSOL defect outline as a dashed cyan polygon.
+For a later matching model, pass `--defect-model path/to/model.mph` to
+`plotting.py`; build and save its geometry first so the outline is current.
+
+## Defect evidence and localization check
+
+```powershell
+python analyse.py --validate --line right --mode PP --component direct
+python plotting.py --validate --line right --mode PP --component direct --output figures/defect_evidence.png
+```
+
+An example from the current data is saved as `figures/defect_evidence.png`.
+
+The early-pulse comparison picks each arrival only from the defect-free
+reference in a 4.0-5.5 microsecond window. It compares defect/reference RMS
+velocity within 0.2 microseconds of each pick, using the same 2-8 MHz band
+for both simulations. These pulses are not assigned a P or S label. In the
+current exports, the median amplitude ratio is about 0.99 on the left and
+0.26 on the right. This shows a strong change in right-side transmission but
+does not specify the defect depth.
+
+The validation image reconstructs the full selected receiver line and its
+even and odd receiver subsets. A peak that moves with the aperture is
+unreliable; a stable peak can still come from the wall or groove. The
+current PP direct example peaks at about `x=2.5 mm, y=0 mm` in both halves,
+on the back-wall edge and outside the COMSOL defect outline. It is not a
+validated defect location.
+
+Add `--output evidence.npz` to the analysis command to save the split images,
+side-line ratios, and receiver coordinates. Use `--mode` and `--component` to
+inspect wave and path hypotheses separately. Apply `--time-offset-us` only
+with a physically justified offset: the strongest side-line reference pulse
+gives an apparent PP offset near 1.7 microseconds, but may contain converted
+or S-wave energy. The weld-line source response peaks near 0.04 microseconds.
+
+All internal distances and times use metres and seconds. Command-line pixel
+sizes are in millimetres; `--time-offset-us` is in microseconds.

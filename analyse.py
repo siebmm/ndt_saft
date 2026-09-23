@@ -133,6 +133,33 @@ class ReferenceArrivalCalibration:
     residual_rms: float
 
 
+@dataclass(frozen=True)
+class ArrivalComparison:
+    """Reference-picked pulse amplitudes in matched COMSOL simulations.
+
+    Attributes
+    ----------
+    data : ReceiverData
+        Receiver coordinates and time axis for the paired simulations.
+    picked_times : numpy.ndarray
+        Time of the strongest reference pulse in the search window, in seconds.
+    amplitude_ratios : numpy.ndarray
+        Defect/reference RMS velocity ratio around each picked pulse.
+    correlation : numpy.ndarray
+        Normalized defect/reference waveform correlation in the same window.
+
+    Notes
+    -----
+    A small ratio indicates loss of transmitted surface motion. It does not
+    identify the propagation mode or locate the scattering feature by itself.
+    """
+
+    data: ReceiverData
+    picked_times: np.ndarray
+    amplitude_ratios: np.ndarray
+    correlation: np.ndarray
+
+
 def _normalise_receiver_indices(receiver_indices, num_receivers):
     """Validate and normalize a receiver-point selection.
 
@@ -669,6 +696,97 @@ def load_calibrated_receiver_data(
     )
 
 
+def compare_reference_arrivals(
+    receiver_lines='sides',
+    receiver_indices=None,
+    search_window=(4e-6, 5.5e-6),
+    pulse_half_width=0.2e-6,
+    frequency_band=(2e6, 8e6),
+):
+    """Measure changes to an early pulse using picks from the reference model.
+
+    Parameters
+    ----------
+    receiver_lines : str or sequence of str, default='sides'
+        Receiver lines to compare.
+    receiver_indices : int, slice, array-like, mapping, or None
+        Receiver-point selection on each line.
+    search_window : tuple of float, default=(4e-6, 5.5e-6)
+        Time interval in seconds containing the strong early side-line pulse.
+    pulse_half_width : float, default=0.2e-6
+        Half-width in seconds of the amplitude comparison around each pick.
+    frequency_band : tuple of float or None, default=(2e6, 8e6)
+        Band-pass range in hertz, applied equally to both simulations.
+
+    Returns
+    -------
+    ArrivalComparison
+        Reference pulse times, defect/reference RMS ratios, and correlations.
+
+    Raises
+    ------
+    ValueError
+        If the time windows do not contain sufficient samples.
+
+    Notes
+    -----
+    Picks use only defect-free traces. The default interval follows the strong
+    4.5--5.1 microsecond arrivals in the supplied side-line exports. These
+    arrivals can include mode conversion at the groove and are not assigned a
+    P or S label. A ratio below one measures transmission loss, not defect
+    depth. The left side provides a useful control for the right-side flaw.
+    """
+    if len(search_window) != 2:
+        raise ValueError('search_window must contain two times.')
+    search_start, search_stop = (float(value) for value in search_window)
+    pulse_half_width = float(pulse_half_width)
+    if not np.isfinite([search_start, search_stop, pulse_half_width]).all():
+        raise ValueError('Arrival windows must contain finite times.')
+    if search_stop <= search_start or pulse_half_width <= 0:
+        raise ValueError('Arrival windows must have positive width.')
+
+    paired = load_calibrated_receiver_data(
+        receiver_lines=receiver_lines,
+        receiver_indices=receiver_indices,
+        frequency_band=frequency_band,
+    )
+    times = paired.reference.times
+    search = (times >= search_start) & (times <= search_stop)
+    if np.count_nonzero(search) < 3:
+        raise ValueError('search_window contains fewer than three samples.')
+
+    reference = paired.reference.time_series_matrix
+    defective = paired.defective.time_series_matrix
+    envelope = np.abs(hilbert(reference, axis=1))
+    search_indices = np.flatnonzero(search)
+    picks = search_indices[np.argmax(envelope[:, search], axis=1)]
+    picked_times = times[picks]
+    amplitude_ratios = np.full(len(picks), np.nan)
+    correlation = np.full(len(picks), np.nan)
+    for row, pick_time in enumerate(picked_times):
+        pulse = np.abs(times - pick_time) <= pulse_half_width
+        if np.count_nonzero(pulse) < 3:
+            raise ValueError('pulse_half_width contains fewer than three samples.')
+        reference_pulse = reference[row, pulse]
+        defective_pulse = defective[row, pulse]
+        reference_norm = np.linalg.norm(reference_pulse)
+        defective_norm = np.linalg.norm(defective_pulse)
+        if reference_norm > 0:
+            amplitude_ratios[row] = defective_norm / reference_norm
+        if reference_norm > 0 and defective_norm > 0:
+            correlation[row] = (
+                np.dot(defective_pulse, reference_pulse)
+                / (defective_norm * reference_norm)
+            )
+
+    return ArrivalComparison(
+        data=paired.reference,
+        picked_times=picked_times,
+        amplitude_ratios=amplitude_ratios,
+        correlation=correlation,
+    )
+
+
 
 
 
@@ -1171,7 +1289,10 @@ def estimate_reference_time_offset(
     -----
     Each trace is RMS-normalized before scoring so a few high-amplitude
     receivers cannot determine the fit. Only defect-free signals and known
-    source/receiver geometry are used.
+    source/receiver geometry are used. The score follows the strongest
+    compatible envelope ridge. In the supplied side-line traces, the fitted
+    P-wave ridge may include mode-converted or S-wave energy. Inspect the
+    picks and physical path before applying its offset to an image.
     """
     data = load_receiver_data(
         receiver_lines, receiver_indices, dataset=reference_dataset
@@ -1740,6 +1861,109 @@ def perform_segmented_saft(
     return GX, GY, saft_image
 
 
+def compare_saft_apertures(
+    receiver_line='right',
+    mode='PP',
+    component='direct',
+    x_range=(-0.008, 0.008),
+    y_range=(0.0, 0.009),
+    pixel_size=0.00025,
+    time_offset=0.0,
+    frequency_band=(2e6, 8e6),
+):
+    """Check whether a SAFT focus persists in independent receiver subsets.
+
+    Parameters
+    ----------
+    receiver_line : {'left', 'right', 'weld'}, default='right'
+        One COMSOL receiver line to reconstruct.
+    mode : {'PP', 'PS', 'SP', 'SS'}, default='PP'
+        Propagation mode on the source and receiver legs, respectively.
+    component : {'direct', 'backwall'}, default='direct'
+        Scattering path to inspect without mixing two path hypotheses.
+    x_range : tuple of float, default=(-0.008, 0.008)
+        Horizontal image bounds in metres.
+    y_range : tuple of float, default=(0.0, 0.009)
+        Vertical image bounds in metres.
+    pixel_size : float, default=0.00025
+        Maximum image-pixel spacing in metres.
+    time_offset : float, default=0.0
+        Explicit arrival-time shift in seconds. The strongest side-line pulse
+        must not be used automatically as a P-wave timing calibration.
+    frequency_band : tuple of float or None, default=(2e6, 8e6)
+        Common filtering band for all three reconstructions.
+
+    Returns
+    -------
+    gx, gy : numpy.ndarray
+        Image coordinates in metres.
+    images : dict of str to numpy.ndarray
+        Full, even-index, and odd-index SAFT envelope images.
+    peaks : dict of str to tuple of float
+        Coordinates of each strongest pixel in metres, or NaN for a zero image.
+    split_separation : float
+        Distance between even and odd image peaks in metres.
+
+    Raises
+    ------
+    ValueError
+        If the line, wave mode, or scattering component is unsupported.
+
+    Notes
+    -----
+    The split tests focus stability under a change in receiver aperture. It
+    cannot establish that a peak is a defect: groove scattering, an incorrect
+    path model, and transmission shadow can also persist in both halves.
+    """
+    if receiver_line not in ('left', 'right', 'weld'):
+        raise ValueError("receiver_line must be 'left', 'right', or 'weld'.")
+    mode = str(mode).upper()
+    if mode not in ('PP', 'PS', 'SP', 'SS'):
+        raise ValueError("mode must be 'PP', 'PS', 'SP', or 'SS'.")
+    if component not in ('direct', 'backwall'):
+        raise ValueError("component must be 'direct' or 'backwall'.")
+
+    receiver_count = len(load_receiver_data(receiver_line).x_coords)
+    if receiver_count < 4:
+        raise ValueError('At least four receivers are required for an aperture split.')
+    selections = {
+        'all': np.arange(receiver_count),
+        'even': np.arange(0, receiver_count, 2),
+        'odd': np.arange(1, receiver_count, 2),
+    }
+    images = {}
+    peaks = {}
+    gx = gy = None
+    for name, indices in selections.items():
+        gx, gy, components = perform_segmented_saft(
+            receiver_lines=receiver_line,
+            receiver_indices=indices,
+            x_range=x_range,
+            y_range=y_range,
+            pixel_size=pixel_size,
+            source_wave_type=mode[0],
+            receiver_wave_type=mode[1],
+            dataset='defect',
+            reference_dataset='reference',
+            frequency_band=frequency_band,
+            time_offset=time_offset,
+            image_mode='envelope',
+            return_components=True,
+        )
+        images[name] = components[component]
+        if np.max(images[name]) > 0:
+            row, column = np.unravel_index(np.argmax(images[name]), gx.shape)
+            peaks[name] = (float(gx[row, column]), float(gy[row, column]))
+        else:
+            peaks[name] = (np.nan, np.nan)
+
+    split_separation = float(np.hypot(
+        peaks['even'][0] - peaks['odd'][0],
+        peaks['even'][1] - peaks['odd'][1],
+    ))
+    return gx, gy, images, peaks, split_separation
+
+
 def main():
     """Run numerical SAFT on the defect-minus-reference receiver signals.
 
@@ -1747,7 +1971,9 @@ def main():
     -----
     The command uses the chosen source and receiver wave modes to calculate
     travel times, then reports the strongest pixel in each SAFT component.
-    ``--output`` saves the grid and images for later plotting or comparison.
+    ``--validate`` first compares reference-picked early pulses on both sides,
+    then tests whether a selected SAFT focus survives even/odd receiver
+    splitting. ``--output`` saves the chosen grid and images.
     """
     import argparse
 
@@ -1755,10 +1981,56 @@ def main():
     parser.add_argument('--line', choices=('left', 'right', 'weld', 'sides'), default='right')
     parser.add_argument('--mode', choices=('PP', 'PS', 'SP', 'SS'), default='SS')
     parser.add_argument('--pixel-size-mm', type=float, default=0.25)
+    parser.add_argument('--validate', action='store_true', help='Compare early arrivals and split-aperture SAFT')
+    parser.add_argument('--component', choices=('direct', 'backwall'), default='direct')
+    parser.add_argument('--time-offset-us', type=float, default=0.0)
     parser.add_argument('--output', type=Path, help='Optional NPZ file for the grid and SAFT components')
     args = parser.parse_args()
     if args.pixel_size_mm <= 0:
         parser.error('--pixel-size-mm must be positive')
+    if args.validate:
+        if args.line == 'sides':
+            parser.error('--validate needs one receiver line for aperture splitting')
+        comparison = compare_reference_arrivals('sides')
+        for line_name in ('left', 'right'):
+            selected = comparison.data.line_names == line_name
+            ratios = comparison.amplitude_ratios[selected]
+            print(
+                f'{line_name} early pulse: median defect/reference RMS '
+                f'={np.nanmedian(ratios):.3f}, '
+                f'10--90% range={np.nanpercentile(ratios, 10):.3f}--'
+                f'{np.nanpercentile(ratios, 90):.3f}'
+            )
+        gx, gy, images, peaks, separation = compare_saft_apertures(
+            receiver_line=args.line,
+            mode=args.mode,
+            component=args.component,
+            pixel_size=args.pixel_size_mm / 1000,
+            time_offset=args.time_offset_us * 1e-6,
+        )
+        print(f'{args.mode} {args.component} split-aperture peak separation: {separation * 1000:.3f} mm')
+        for name, position in peaks.items():
+            print(f'{name}: x={position[0] * 1000:.3f} mm, y={position[1] * 1000:.3f} mm')
+        if args.output:
+            np.savez_compressed(
+                args.output, x=gx, y=gy, **images,
+                mode=args.mode, component=args.component,
+                time_offset_s=args.time_offset_us * 1e-6,
+                left_ratios=comparison.amplitude_ratios[
+                    comparison.data.line_names == 'left'
+                ],
+                right_ratios=comparison.amplitude_ratios[
+                    comparison.data.line_names == 'right'
+                ],
+                left_receiver_x=comparison.data.x_coords[
+                    comparison.data.line_names == 'left'
+                ],
+                right_receiver_x=comparison.data.x_coords[
+                    comparison.data.line_names == 'right'
+                ],
+            )
+            print(f'Saved {args.output}')
+        return
 
     calibration = load_calibrated_receiver_data(args.line)
     residual_rms = np.sqrt(np.mean(calibration.difference.time_series_matrix ** 2))

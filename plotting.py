@@ -4,19 +4,119 @@ Notes
 -----
 A-scans show velocity versus time at one receiver. B-scans show arrivals
 across a receiver line. SAFT panels show how direct and back-wall paths focus
-the defect-minus-reference signals in the pipe-wall cross section.
+the defect-minus-reference signals in the pipe-wall cross section. Their
+dashed cyan outline shows the known defect from the saved COMSOL geometry.
 """
+
+import re
+import xml.etree.ElementTree as ET
+import zipfile
+from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
 
 from analyse import (
     DEFAULT_LASER_SOURCE,
+    compare_reference_arrivals,
+    compare_saft_apertures,
     load_calibrated_receiver_data,
     load_receiver_data,
     perform_segmented_saft,
     saft_geometry,
 )
+
+
+DEFECT_MODEL = Path(__file__).resolve().parent / 'weld_defect_v1.mph'
+
+
+def load_comsol_defect_outline(model_path=DEFECT_MODEL):
+    """Read the built lack-of-fusion polygon from the defective COMSOL model.
+
+    Parameters
+    ----------
+    model_path : pathlib.Path or str, default=DEFECT_MODEL
+        Saved defective COMSOL model. Its geometry must have been built.
+
+    Returns
+    -------
+    numpy.ndarray
+        Closed polygon vertices with shape ``(vertices, 2)`` in metres.
+
+    Raises
+    ------
+    ValueError
+        If the saved model lacks the built defect polygon or uses an
+        unsupported geometry length unit.
+
+    Notes
+    -----
+    COMSOL stores the evaluated polygon vertices in ``dmodel.xml`` inside the
+    MPH archive. Reading those vertices keeps the display tied to the actual
+    saved geometry. The outline is only drawn after reconstruction and is
+    never supplied to the SAFT travel-time model.
+    """
+    with zipfile.ZipFile(model_path) as archive:
+        model = ET.fromstring(archive.read('dmodel.xml'))
+
+    geometry = next(
+        (item for item in model.iter('GeomSequence') if item.get('tag') == 'geom1'),
+        None,
+    )
+    if geometry is None:
+        raise ValueError('The COMSOL model has no geom1 geometry.')
+    unit = geometry.findtext('lengthUnit')
+    if unit not in ('mm', 'm'):
+        raise ValueError(f'Unsupported COMSOL geometry length unit: {unit!r}.')
+
+    feature = next(
+        (item for item in geometry.iter('GeomFeature')
+         if item.get('name') == 'Right sidewall lack of fusion'),
+        None,
+    )
+    if feature is None:
+        raise ValueError('The COMSOL model has no right sidewall defect feature.')
+    if feature.findtext('buildStatus') != 'BUILT':
+        raise ValueError('Build and save the COMSOL defect geometry before plotting.')
+    polygon = next(
+        (item for item in feature.findall('propertyValue')
+         if item.get('name') == 'p:segvtxvalid'),
+        None,
+    )
+    if polygon is None:
+        raise ValueError('Build and save the COMSOL defect geometry before plotting.')
+    coordinates = re.findall(
+        r"\|2,'([^']+)','([^']+)'", polygon.get('valueMatrix', '')
+    )
+    if len(coordinates) < 4:
+        raise ValueError('The COMSOL defect polygon has too few vertices.')
+    vertices = np.asarray(coordinates, dtype=float)
+    if not np.allclose(vertices[0], vertices[-1]):
+        vertices = np.vstack((vertices, vertices[0]))
+    return vertices * (0.001 if unit == 'mm' else 1.0)
+
+
+def _draw_comsol_defect(ax, outline, scale=1.0):
+    """Mark the known COMSOL defect on a localization axis.
+
+    Parameters
+    ----------
+    ax : matplotlib.axes.Axes
+        Image axis using x and y positions from the pipe-wall cross section.
+    outline : numpy.ndarray
+        Closed defect polygon in metres.
+    scale : float, default=1.0
+        Conversion factor from metres to the displayed axis units.
+    """
+    ax.plot(
+        outline[:, 0] * scale,
+        outline[:, 1] * scale,
+        color='cyan',
+        linestyle='--',
+        linewidth=2,
+        label='COMSOL defect (known)',
+    )
+    ax.legend(loc='upper right', fontsize='small')
 
 
 def _symmetric_colour_limit(signals, percentile):
@@ -477,6 +577,7 @@ def compare_saft_modes(
     component='direct',
     common_colour_scale=False,
     colour_percentile=99.5,
+    defect_model=DEFECT_MODEL,
     **saft_options,
 ):
     """Reconstruct propagation modes separately for one receiver line.
@@ -500,6 +601,8 @@ def compare_saft_modes(
         comparison.
     colour_percentile : float or None, default=99.5
         Absolute-amplitude percentile used for the image colour limits.
+    defect_model : pathlib.Path or str, default=DEFECT_MODEL
+        Matching COMSOL model used to draw the known defect outline.
     **saft_options : dict
         Additional keyword arguments forwarded to
         :func:`perform_segmented_saft`. Mode selection, receiver selection,
@@ -531,7 +634,8 @@ def compare_saft_modes(
     -----
     This routine does not combine modes and does not select a preferred mode.
     Candidate indications should be checked for spatial consistency across
-    independent receiver subsets before any line or mode fusion.
+    independent receiver subsets before any line or mode fusion. The dashed
+    outline marks the known COMSOL defect for comparison only.
     """
     if not isinstance(receiver_line, str):
         raise TypeError("receiver_line must be one line name, not a sequence.")
@@ -607,6 +711,7 @@ def compare_saft_modes(
     source_position = np.asarray(
         saft_options.get('source_position', DEFAULT_LASER_SOURCE), dtype=float
     )
+    defect_outline = load_comsol_defect_outline(defect_model)
     for axis, mode in zip(axes.flat, normalised_modes):
         image = mode_images[mode]
         colour_limit = (
@@ -629,6 +734,7 @@ def compare_saft_modes(
             color='lime',
             markersize=10,
         )
+        _draw_comsol_defect(axis, defect_outline)
         axis.set_title(f'{mode[0]}->{mode[1]} {component} SAFT')
         axis.set_xlabel('X Coordinate [m]')
         axis.set_ylabel('Y Coordinate [m]')
@@ -652,7 +758,8 @@ def compare_saft_modes(
 
 
 def plot_segmented_saft(
-    receiver_lines='right', *, colour_percentile=99.5, **saft_options
+    receiver_lines='right', *, colour_percentile=99.5,
+    defect_model=DEFECT_MODEL, **saft_options
 ):
     """Plot direct, back-wall, and combined SAFT images for one aperture.
 
@@ -662,6 +769,8 @@ def plot_segmented_saft(
         Receiver line or lines used to form the images.
     colour_percentile : float or None, default=99.5
         Percentile of absolute image amplitude used for the colour scale.
+    defect_model : pathlib.Path or str, default=DEFECT_MODEL
+        Matching COMSOL model used to draw the known defect outline.
     **saft_options : dict
         Physical and signal-processing options passed to
         :func:`analyse.perform_segmented_saft`.
@@ -680,7 +789,8 @@ def plot_segmented_saft(
     Notes
     -----
     The speed map and image pixels share the same cross-section coordinates.
-    The green star marks the laser source position.
+    The green star marks the laser source position. The dashed outline marks
+    the known COMSOL defect; it is not used to form the SAFT image.
     """
     if 'return_components' in saft_options:
         raise ValueError('return_components is controlled by plot_segmented_saft.')
@@ -694,6 +804,7 @@ def plot_segmented_saft(
     receiver_mode = str(saft_options.get('receiver_wave_type') or wave_type).upper()
     image_mode = str(saft_options.get('image_mode', 'signed')).lower()
     source_x, source_y = saft_options.get('source_position', DEFAULT_LASER_SOURCE)
+    defect_outline = load_comsol_defect_outline(defect_model)
     _, cp, cs = saft_geometry(gx, gy)
     speed_map = cs if receiver_mode == 'S' else cp
     selection = load_receiver_data(
@@ -745,10 +856,114 @@ def plot_segmented_saft(
         fig.colorbar(plotted, ax=axis, label=amplitude_label)
     for axis in axes.flat:
         axis.plot(source_x, source_y, marker='*', color='lime', markersize=10)
+        _draw_comsol_defect(axis, defect_outline)
         axis.set_xlabel('X Coordinate [m]')
         axis.set_ylabel('Y Coordinate [m]')
     plt.show()
     return gx, gy, components, fig, axes
+
+
+def plot_defect_evidence(
+    receiver_line='right',
+    mode='PP',
+    component='direct',
+    pixel_size=0.00025,
+    time_offset=0.0,
+    defect_model=DEFECT_MODEL,
+):
+    """Show early-pulse transmission loss and independent SAFT apertures.
+
+    Parameters
+    ----------
+    receiver_line : {'left', 'right', 'weld'}, default='right'
+        Receiver line used for the aperture comparison.
+    mode : {'PP', 'PS', 'SP', 'SS'}, default='PP'
+        Source and receiver propagation modes.
+    component : {'direct', 'backwall'}, default='direct'
+        Scattering path shown in the SAFT panels.
+    pixel_size : float, default=0.00025
+        Maximum image-pixel spacing in metres.
+    time_offset : float, default=0.0
+        Explicit delay added to modelled SAFT arrival times, in seconds.
+    defect_model : pathlib.Path or str, default=DEFECT_MODEL
+        Matching COMSOL model used to draw the known defect outline.
+
+    Returns
+    -------
+    fig : matplotlib.figure.Figure
+        Figure containing measured pulse ratios and split-aperture images.
+    axes : numpy.ndarray
+        Two-by-three array of axes in the figure.
+
+    Notes
+    -----
+    The pulse ratios use reference-picked early arrivals and do not depend on
+    the SAFT travel-time model. All SAFT panels use defect-minus-reference
+    traces. The dashed COMSOL defect outline is shown only for comparison.
+    A split-stable focus can still be a groove or wall artefact.
+    """
+    arrival = compare_reference_arrivals('sides')
+    gx, gy, images, peaks, separation = compare_saft_apertures(
+        receiver_line=receiver_line,
+        mode=mode,
+        component=component,
+        pixel_size=pixel_size,
+        time_offset=time_offset,
+    )
+
+    fig, axes = plt.subplots(2, 3, figsize=(16, 9), constrained_layout=True)
+    for line, colour in (('left', 'tab:blue'), ('right', 'tab:orange')):
+        selected = arrival.data.line_names == line
+        x_mm = arrival.data.x_coords[selected] * 1000
+        axes[0, 0].plot(
+            x_mm, arrival.amplitude_ratios[selected], '.-', color=colour,
+            label=f'{line} (median {np.nanmedian(arrival.amplitude_ratios[selected]):.2f})',
+        )
+        axes[0, 1].plot(
+            x_mm, arrival.correlation[selected], '.-', color=colour,
+            label=line,
+        )
+    axes[0, 0].axhline(1.0, color='black', linestyle=':', linewidth=1)
+    axes[0, 0].set_title('Early pulse: defect / reference RMS')
+    axes[0, 0].set_ylabel('Amplitude ratio')
+    axes[0, 1].set_title('Early pulse waveform correlation')
+    axes[0, 1].set_ylabel('Correlation')
+    for axis in axes[0, :2]:
+        axis.set_xlabel('Receiver x [mm]')
+        axis.legend()
+        axis.grid(alpha=0.2)
+
+    axes[0, 2].axis('off')
+    axes[0, 2].text(
+        0.02, 0.95,
+        f'{receiver_line} receiver line\n'
+        f'{mode} {component} SAFT\n'
+        f'Timing shift: {time_offset * 1e6:.2f} us\n'
+        f'Even/odd peak separation: {separation * 1000:.2f} mm\n\n'
+        'A repeatable image peak is a candidate,\n'
+        'not a confirmed defect location.',
+        va='top', transform=axes[0, 2].transAxes,
+    )
+
+    colour_limit = max(float(np.max(image)) for image in images.values())
+    extent_mm = np.array([gx.min(), gx.max(), gy.min(), gy.max()]) * 1000
+    defect_outline = load_comsol_defect_outline(defect_model)
+    for axis, (name, image) in zip(axes[1], images.items()):
+        plotted = axis.imshow(
+            image, extent=extent_mm, origin='lower', cmap='inferno',
+            vmin=0, vmax=colour_limit or 1,
+        )
+        peak_x, peak_y = peaks[name]
+        if np.isfinite(peak_x):
+            axis.plot(peak_x * 1000, peak_y * 1000, 'cx', markersize=9)
+        _draw_comsol_defect(axis, defect_outline, scale=1000)
+        axis.set_title(f'{name} receivers')
+        axis.set_xlabel('x [mm]')
+        axis.set_ylabel('y [mm]')
+        axis.set_aspect('equal')
+    fig.colorbar(plotted, ax=axes[1, :], label='SAFT envelope [m/s]')
+    plt.show()
+    return fig, axes
 
 
 def main():
@@ -758,7 +973,9 @@ def main():
     -----
     The default figure uses defect-minus-reference velocity with S waves on
     both propagation legs. ``--diagnostics`` shows the raw receiver evidence
-    before SAFT reconstruction.
+    before SAFT reconstruction. ``--validate`` compares early side-line
+    transmission and independent receiver-aperture images. ``--output`` saves
+    either SAFT figure with the known COMSOL defect outline.
     """
     import argparse
 
@@ -767,21 +984,42 @@ def main():
     parser.add_argument('--mode', choices=('PP', 'PS', 'SP', 'SS'), default='SS')
     parser.add_argument('--pixel-size-mm', type=float, default=0.25)
     parser.add_argument('--diagnostics', action='store_true')
+    parser.add_argument('--validate', action='store_true')
+    parser.add_argument('--component', choices=('direct', 'backwall'), default='direct')
+    parser.add_argument('--time-offset-us', type=float, default=0.0)
+    parser.add_argument('--defect-model', type=Path, default=DEFECT_MODEL)
+    parser.add_argument('--output', type=Path, help='Save the SAFT figure to this image file')
     args = parser.parse_args()
     if args.pixel_size_mm <= 0:
         parser.error('--pixel-size-mm must be positive')
-    if args.diagnostics:
+    if args.diagnostics and args.output:
+        parser.error('--output is for SAFT figures, not --diagnostics')
+    if args.validate:
+        if args.line == 'sides':
+            parser.error('--validate needs one receiver line for aperture splitting')
+        fig, _ = plot_defect_evidence(
+            receiver_line=args.line,
+            mode=args.mode,
+            component=args.component,
+            pixel_size=args.pixel_size_mm / 1000,
+            time_offset=args.time_offset_us * 1e-6,
+            defect_model=args.defect_model,
+        )
+    elif args.diagnostics:
         plot_calibration_bscans(args.line)
         plot_comsol_ascan(args.line)
     else:
-        plot_segmented_saft(
+        _, _, _, fig, _ = plot_segmented_saft(
             receiver_lines=args.line,
             reference_dataset='reference',
             source_wave_type=args.mode[0],
             receiver_wave_type=args.mode[1],
             pixel_size=args.pixel_size_mm / 1000,
             image_mode='envelope',
+            defect_model=args.defect_model,
         )
+    if args.output:
+        fig.savefig(args.output, dpi=180)
 
 
 if __name__ == '__main__':
