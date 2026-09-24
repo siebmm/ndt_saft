@@ -27,7 +27,7 @@ from analyse import (
 )
 
 
-DEFECT_MODEL = Path(__file__).resolve().parent / 'weld_defect_v1.mph'
+DEFECT_MODEL = Path(__file__).resolve().parent / 'data' / 'models' / 'weld_defect_v1.mph'
 
 
 def load_comsol_defect_outline(model_path=DEFECT_MODEL):
